@@ -1,0 +1,16 @@
+{
+  "name": "hamad-mind-server",
+  "version": "2.0.0",
+  "description": "خادم Hamad Mind AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
