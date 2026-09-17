@@ -1,27 +1,31 @@
 // ============================================================
-// Hamad Mind Server v4.0.0
-// Chat + TTS + Update + Admin Panel + تدوير المفاتيح
+// Hamad Mind Server v5.0.0
+// Chat + TTS + Update + Admin + MongoDB + نظام الحظر
 // ============================================================
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const { GoogleGenAI } = require('@google/genai');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '50mb' }));
 
-// ---------- المسارات ----------
-const HISTORY_FILE = path.join(__dirname, 'gemini_chat_history.json');
-const CONFIG_FILE  = path.join(__dirname, 'server_config.json');
-
-// ---------- إعدادات Admin ----------
-// ضع التوكن في Environment Variable على Render باسم ADMIN_TOKEN
+// ============================================================
+// 1. الإعدادات
+// ============================================================
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'hamad_admin_2026';
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = 'hamadmind';
 
-// ---------- قراءة المفاتيح ----------
+// حد الرسائل لكل مستخدم (عدّله كما تريد)
+const MAX_MESSAGES_PER_USER = 100;
+
+// نافذة الوقت للحد (24 ساعة)
+const QUOTA_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// ---------- المفاتيح ----------
 const RAW_KEYS = process.env.GEMINI_API_KEYS || '';
 const GEMINI_API_KEYS = RAW_KEYS.split(',').map(k => k.trim()).filter(k => k.length > 0);
 
@@ -30,10 +34,14 @@ if (GEMINI_API_KEYS.length === 0) {
     process.exit(1);
 }
 console.log(`✅ تم تحميل ${GEMINI_API_KEYS.length} مفتاح`);
-console.log(`🔐 ADMIN_TOKEN مُهيأ`);
+
+if (!MONGODB_URI) {
+    console.error('❌ MONGODB_URI غير موجود في متغيرات البيئة');
+    process.exit(1);
+}
+console.log(`✅ MONGODB_URI مُهيأ`);
 
 let currentKeyIndex = 0;
-
 function getCurrentKey() { return GEMINI_API_KEYS[currentKeyIndex]; }
 function switchToNextKey() {
     currentKeyIndex = (currentKeyIndex + 1) % GEMINI_API_KEYS.length;
@@ -50,18 +58,125 @@ const AVAILABLE_MODELS = {
 };
 function resolveModel(key) { return AVAILABLE_MODELS[key] || 'gemini-2.5-flash'; }
 
-// ---------- إدارة الملفات ----------
-function loadJSON(file, fallback) {
-    try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
-    catch (e) { console.error('قراءة فاشلة:', e.message); }
-    return fallback;
+// ============================================================
+// 2. الاتصال بـ MongoDB
+// ============================================================
+let db = null;
+const mongoClient = new MongoClient(MONGODB_URI);
+
+async function connectDB() {
+    try {
+        await mongoClient.connect();
+        db = mongoClient.db(DB_NAME);
+        console.log('✅ تم الاتصال بـ MongoDB');
+
+        // إنشاء الفهارس (indices) للأداء
+        await db.collection('users').createIndex({ userId: 1 }, { unique: true });
+        await db.collection('messages').createIndex({ userId: 1, time: -1 });
+        await db.collection('config').createIndex({ key: 1 }, { unique: true });
+
+        console.log('✅ تم إنشاء الفهارس');
+    } catch (error) {
+        console.error('❌ فشل الاتصال بـ MongoDB:', error.message);
+    }
 }
-function saveJSON(file, data) {
-    try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); }
-    catch (e) { console.error('كتابة فاشلة:', e.message); }
+connectDB();
+
+// ============================================================
+// 3. دوال مساعدة لقاعدة البيانات
+// ============================================================
+
+// الحصول على مستخدم أو إنشاؤه
+async function getOrCreateUser(userId) {
+    if (!db) return null;
+    const users = db.collection('users');
+    let user = await users.findOne({ userId });
+    if (!user) {
+        user = {
+            userId,
+            messageCount: 0,
+            totalMessages: 0,
+            isBlocked: false,
+            firstSeen: new Date(),
+            lastSeen: new Date(),
+            messageCountWindow: 0,
+            windowStart: new Date()
+        };
+        await users.insertOne(user);
+    }
+    return user;
 }
 
-// ---------- Middleware للتحقق من Admin ----------
+// التحقق من الحظر والحد اليومي
+async function checkUserQuota(userId) {
+    if (!db) return { allowed: true };
+
+    const user = await getOrCreateUser(userId);
+    if (!user) return { allowed: true };
+
+    // 1. هل هو محظور؟
+    if (user.isBlocked) {
+        return {
+            allowed: false,
+            reason: '🚫 أنت محظور من استخدام Hamad Mind. تواصل مع المطور.'
+        };
+    }
+
+    // 2. فحص النافذة الزمنية (24 ساعة)
+    const now = new Date();
+    const windowStart = new Date(user.windowStart || now);
+    const elapsed = now - windowStart;
+
+    // إذا مرت أكثر من 24 ساعة، أعد تصفير العداد
+    if (elapsed > QUOTA_WINDOW_MS) {
+        await db.collection('users').updateOne(
+            { userId },
+            { $set: { messageCountWindow: 0, windowStart: now } }
+        );
+        return { allowed: true, count: 0, max: MAX_MESSAGES_PER_USER };
+    }
+
+    // 3. هل تجاوز الحد؟
+    const count = user.messageCountWindow || 0;
+    if (count >= MAX_MESSAGES_PER_USER) {
+        return {
+            allowed: false,
+            reason: `🚫 تجاوزت الحد المسموح (${MAX_MESSAGES_PER_USER} رسالة في 24 ساعة). حاول غدًا.`,
+            count, max: MAX_MESSAGES_PER_USER
+        };
+    }
+
+    return { allowed: true, count, max: MAX_MESSAGES_PER_USER };
+}
+
+// تسجيل رسالة جديدة
+async function recordMessage(userId, userMessage, aiReply, model) {
+    if (!db) return;
+
+    const now = new Date();
+
+    // 1. تحديث المستخدم
+    await db.collection('users').updateOne(
+        { userId },
+        {
+            $inc: { messageCount: 1, totalMessages: 1, messageCountWindow: 1 },
+            $set: { lastSeen: now, lastMessage: userMessage }
+        }
+    );
+
+    // 2. حفظ الرسالة
+    await db.collection('messages').insertOne({
+        userId,
+        user: userMessage,
+        ai: aiReply,
+        model,
+        time: now
+    });
+}
+
+// ============================================================
+// 4. Middleware للتحقق من Admin
+// ============================================================
 function requireAdmin(req, res, next) {
     const token = req.headers['x-admin-token'] || req.body.adminToken || req.query.token;
     if (!token || token !== ADMIN_TOKEN) {
@@ -70,7 +185,9 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-// ---------- استدعاء Gemini مع تبديل المفاتيح ----------
+// ============================================================
+// 5. استدعاء Gemini مع تبديل المفاتيح
+// ============================================================
 async function callGeminiWithRetry(modelKey, contents, systemPrompt) {
     const attempts = GEMINI_API_KEYS.length;
     let lastError = null;
@@ -93,17 +210,31 @@ async function callGeminiWithRetry(modelKey, contents, systemPrompt) {
             switchToNextKey();
         }
     }
-    throw new Error('فشلت جميع المفاتيح: ' + (lastError ? lastError.message : 'خطأ غير معروف'));
+    throw new Error('فشلت جميع المفاتيح: ' + (lastError ? lastError.message : 'خطأ'));
 }
 
 // ============================================================
-// 1. مسار المحادثة
+// 6. مسار المحادثة
 // ============================================================
 app.post('/v1/chat', async (req, res) => {
     try {
         const { message, history, model, userId, systemPrompt } = req.body;
         if (!message) return res.status(400).json({ error: 'الرسالة مطلوبة' });
 
+        const uid = userId || 'anonymous';
+
+        // 1. فحص الحظر والحد
+        const quota = await checkUserQuota(uid);
+        if (!quota.allowed) {
+            return res.status(403).json({
+                error: quota.reason,
+                blocked: true,
+                count: quota.count,
+                max: quota.max
+            });
+        }
+
+        // 2. بناء contents
         const contents = [];
         if (Array.isArray(history)) {
             history.forEach(item => {
@@ -117,20 +248,24 @@ app.post('/v1/chat', async (req, res) => {
         }
         contents.push({ role: 'user', parts: [{ text: message }] });
 
+        // 3. استدعاء Gemini
+        const usedModel = resolveModel(model || 'flash');
         const reply = await callGeminiWithRetry(model || 'flash', contents, systemPrompt || null);
 
-        const historyData = loadJSON(HISTORY_FILE, []);
-        historyData.push({
-            userId: userId || 'anonymous',
-            user: message,
-            ai: reply,
-            model: resolveModel(model || 'flash'),
-            time: new Date().toISOString()
-        });
-        if (historyData.length > 1000) historyData.splice(0, historyData.length - 1000);
-        saveJSON(HISTORY_FILE, historyData);
+        // 4. تسجيل الرسالة
+        await recordMessage(uid, message, reply, usedModel);
 
-        res.json({ reply: reply, usedModel: resolveModel(model || 'flash') });
+        // 5. إرجاع الرد
+        res.json({
+            reply: reply,
+            usedModel: usedModel,
+            quota: {
+                used: (quota.count || 0) + 1,
+                max: MAX_MESSAGES_PER_USER,
+                remaining: MAX_MESSAGES_PER_USER - ((quota.count || 0) + 1)
+            }
+        });
+
     } catch (error) {
         console.error('❌ /v1/chat:', error);
         res.status(500).json({ error: error.message });
@@ -138,7 +273,7 @@ app.post('/v1/chat', async (req, res) => {
 });
 
 // ============================================================
-// 2. مسار TTS
+// 7. مسار TTS
 // ============================================================
 app.post('/v1/tts', async (req, res) => {
     try {
@@ -175,16 +310,15 @@ app.post('/v1/tts', async (req, res) => {
                         break;
                     }
                 }
-                if (!audioBase64) throw new Error('لم يتم العثور على بيانات صوتية');
+                if (!audioBase64) throw new Error('لا توجد بيانات صوتية');
 
                 return res.json({ data: audioBase64, mimeType: 'audio/wav', voice: voice || 'Kore' });
             } catch (error) {
                 lastError = error;
-                console.warn(`⚠️ فشل TTS بالمفتاح ${currentKeyIndex + 1}: ${error.message}`);
                 switchToNextKey();
             }
         }
-        throw new Error('فشلت جميع المفاتيح في TTS: ' + (lastError ? lastError.message : 'خطأ'));
+        throw new Error('فشل TTS: ' + (lastError ? lastError.message : 'خطأ'));
     } catch (error) {
         console.error('❌ /v1/tts:', error);
         res.status(500).json({ error: error.message });
@@ -192,111 +326,25 @@ app.post('/v1/tts', async (req, res) => {
 });
 
 // ============================================================
-// 3. مسار التحديث
+// 8. مسار التحديث (عام)
 // ============================================================
-app.get('/v1/update', (req, res) => {
-    const config = loadJSON(CONFIG_FILE, {});
-    res.json({
-        version_code: config.version_code || 201,
-        version_name: config.version_name || '2.0.1',
-        apk_url: config.apk_url || '',
-        notes: config.notes || 'لا يوجد تحديث حالي'
-    });
-});
-
-// ============================================================
-// 4. مسار الصور (قيد التطوير)
-// ============================================================
-app.post('/v1/image', (req, res) => {
-    res.status(501).json({ error: 'توليد الصور غير مهيأ بعد' });
-});
-
-// ============================================================
-// 5. لوحة التحكم — ADMIN APIs
-// ============================================================
-
-// 📊 إحصائيات
-app.get('/v1/admin/stats', requireAdmin, (req, res) => {
-    const history = loadJSON(HISTORY_FILE, []);
-    const users = new Set(history.map(h => h.userId)).size;
-    const totalMessages = history.length;
-    const last24h = history.filter(h => {
-        const diff = Date.now() - new Date(h.time).getTime();
-        return diff < 24 * 60 * 60 * 1000;
-    }).length;
-
-    res.json({
-        totalUsers: users,
-        totalMessages: totalMessages,
-        messagesLast24h: last24h,
-        keysLoaded: GEMINI_API_KEYS.length,
-        currentKeyIndex: currentKeyIndex + 1,
-        serverVersion: '4.0.0',
-        timestamp: new Date().toISOString()
-    });
-});
-
-// 👥 آخر المستخدمين
-app.get('/v1/admin/users', requireAdmin, (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
-    const history = loadJSON(HISTORY_FILE, []);
-
-    // نجمع آخر رسالة لكل مستخدم
-    const usersMap = {};
-    history.forEach(h => {
-        const uid = h.userId || 'anonymous';
-        if (!usersMap[uid]) {
-            usersMap[uid] = {
-                userId: uid,
-                firstSeen: h.time,
-                lastSeen: h.time,
-                messageCount: 0,
-                lastMessage: ''
-            };
+app.get('/v1/update', async (req, res) => {
+    try {
+        if (!db) return res.json({ version_code: 201, version_name: '2.0.1', apk_url: '', notes: '' });
+        const config = await db.collection('config').findOne({ key: 'update' });
+        if (!config) {
+            return res.json({
+                version_code: 201,
+                version_name: '2.0.1',
+                apk_url: '',
+                notes: 'لا يوجد تحديث حالي'
+            });
         }
-        usersMap[uid].lastSeen = h.time;
-        usersMap[uid].messageCount++;
-        usersMap[uid].lastMessage = h.user;
-    });
-
-    const usersArray = Object.values(usersMap)
-        .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen))
-        .slice(0, limit);
-
-    res.json({ users: usersArray, total: Object.keys(usersMap).length });
-});
-
-// ⚙️ حفظ إعدادات السيرفر (config)
-app.post('/v1/admin/config', requireAdmin, (req, res) => {
-    try {
-        const { announcement, min_supported_version } = req.body;
-        const config = loadJSON(CONFIG_FILE, {});
-        if (announcement !== undefined) config.announcement = announcement;
-        if (min_supported_version !== undefined) config.min_supported_version = min_supported_version;
-        config.updatedAt = new Date().toISOString();
-        saveJSON(CONFIG_FILE, config);
-        res.json({ success: true, message: 'تم حفظ الإعدادات', config: config });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 📦 رفع تحديث APK (نسخة مبسطة — ترجع نجاح بدون رفع فعلي)
-app.post('/v1/admin/update', requireAdmin, (req, res) => {
-    try {
-        // ملاحظة: رفع APK يحتاج multer أو تخزين خارجي
-        // هذا رد مؤقت حتى نُعدّ الرفع الفعلي لاحقًا
-        const config = loadJSON(CONFIG_FILE, {});
-        config.version_name = req.body.version_name || config.version_name;
-        config.version_code = parseInt(req.body.version_code) || config.version_code;
-        config.notes = req.body.notes || config.notes;
-        config.updatedAt = new Date().toISOString();
-        saveJSON(CONFIG_FILE, config);
-
         res.json({
-            success: true,
-            message: 'تم استلام بيانات التحديث (بدون رفع APK فعلي بعد)',
-            config: config
+            version_code: config.version_code || 201,
+            version_name: config.version_name || '2.0.1',
+            apk_url: config.apk_url || '',
+            notes: config.notes || ''
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -304,7 +352,189 @@ app.post('/v1/admin/update', requireAdmin, (req, res) => {
 });
 
 // ============================================================
-// 6. معلومات عامة
+// 9. مسار الصور (قيد التطوير)
+// ============================================================
+app.post('/v1/image', (req, res) => {
+    res.status(501).json({ error: 'توليد الصور غير مهيأ بعد' });
+});
+
+// ============================================================
+// 10. ADMIN APIs
+// ============================================================
+
+// 📊 الإحصائيات
+app.get('/v1/admin/stats', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const totalUsers = await db.collection('users').countDocuments();
+        const blockedUsers = await db.collection('users').countDocuments({ isBlocked: true });
+        const totalMessages = await db.collection('messages').countDocuments();
+
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const messagesLast24h = await db.collection('messages').countDocuments({
+            time: { $gte: oneDayAgo }
+        });
+
+        // مجموع رسائل جميع المستخدمين
+        const pipeline = [
+            { $group: { _id: null, total: { $sum: '$totalMessages' } } }
+        ];
+        const agg = await db.collection('users').aggregate(pipeline).toArray();
+        const totalFromUsers = agg.length > 0 ? agg[0].total : 0;
+
+        res.json({
+            totalUsers,
+            blockedUsers,
+            totalMessages,
+            totalMessagesFromUsers: totalFromUsers,
+            messagesLast24h,
+            maxPerUser: MAX_MESSAGES_PER_USER,
+            keysLoaded: GEMINI_API_KEYS.length,
+            currentKeyIndex: currentKeyIndex + 1,
+            serverVersion: '5.0.0',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 👥 المستخدمون
+app.get('/v1/admin/users', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const limit = parseInt(req.query.limit) || 50;
+        const users = await db.collection('users')
+            .find({})
+            .sort({ lastSeen: -1 })
+            .limit(limit)
+            .toArray();
+
+        const total = await db.collection('users').countDocuments();
+
+        res.json({
+            users: users.map(u => ({
+                userId: u.userId,
+                messageCount: u.messageCount || 0,
+                totalMessages: u.totalMessages || 0,
+                messageCountWindow: u.messageCountWindow || 0,
+                isBlocked: u.isBlocked || false,
+                firstSeen: u.firstSeen,
+                lastSeen: u.lastSeen,
+                lastMessage: u.lastMessage || ''
+            })),
+            total,
+            maxPerUser: MAX_MESSAGES_PER_USER
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 🚫 حظر / فك حظر مستخدم
+app.post('/v1/admin/block', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const { userId, block } = req.body;
+        if (!userId) return res.status(400).json({ error: 'userId مطلوب' });
+
+        const isBlocked = block !== false; // افتراضي: حظر
+
+        const result = await db.collection('users').updateOne(
+            { userId },
+            { $set: { isBlocked, blockedAt: isBlocked ? new Date() : null } },
+            { upsert: true }
+        );
+
+        res.json({
+            success: true,
+            userId,
+            isBlocked,
+            message: isBlocked ? '✅ تم حظر المستخدم' : '✅ تم فك الحظر'
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 🔄 تصفير عداد مستخدم
+app.post('/v1/admin/reset', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const { userId } = req.body;
+        if (!userId) return res.status(400).json({ error: 'userId مطلوب' });
+
+        await db.collection('users').updateOne(
+            { userId },
+            { $set: { messageCountWindow: 0, windowStart: new Date(), isBlocked: false } }
+        );
+
+        res.json({ success: true, message: '✅ تم تصفير العداد وفك الحظر' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ⚙️ حفظ إعدادات السيرفر
+app.post('/v1/admin/config', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const { announcement, min_supported_version } = req.body;
+        const update = { updatedAt: new Date() };
+        if (announcement !== undefined) update.announcement = announcement;
+        if (min_supported_version !== undefined) update.min_supported_version = min_supported_version;
+
+        await db.collection('config').updateOne(
+            { key: 'general' },
+            { $set: update },
+            { upsert: true }
+        );
+
+        res.json({ success: true, message: '✅ تم حفظ الإعدادات' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 📦 حفظ بيانات التحديث (بدون رفع APK فعلي)
+app.post('/v1/admin/update', requireAdmin, async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'قاعدة البيانات غير متصلة' });
+
+        const { version_name, version_code, notes, apk_url } = req.body;
+
+        const update = {
+            key: 'update',
+            version_name: version_name || '2.0.1',
+            version_code: parseInt(version_code) || 201,
+            notes: notes || '',
+            apk_url: apk_url || '',
+            updatedAt: new Date()
+        };
+
+        await db.collection('config').updateOne(
+            { key: 'update' },
+            { $set: update },
+            { upsert: true }
+        );
+
+        res.json({
+            success: true,
+            message: '✅ تم حفظ بيانات التحديث',
+            note: 'ملاحظة: رفع APK الفعلي غير مدعوم حاليًا. استخدم apk_url لرابط خارجي.'
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// 11. معلومات عامة
 // ============================================================
 app.get('/v1/models', (req, res) => {
     res.json({ models: Object.keys(AVAILABLE_MODELS) });
@@ -313,17 +543,22 @@ app.get('/v1/models', (req, res) => {
 app.get('/', (req, res) => {
     res.json({
         status: 'Hamad Mind Server يعمل ✅',
-        version: '4.0.0',
+        version: '5.0.0',
+        dbConnected: !!db,
         keysLoaded: GEMINI_API_KEYS.length,
         currentKeyIndex: currentKeyIndex + 1,
         models: Object.keys(AVAILABLE_MODELS),
-        features: ['chat', 'tts', 'update', 'admin']
+        features: ['chat', 'tts', 'update', 'admin', 'mongodb', 'quota', 'blocking'],
+        maxPerUser: MAX_MESSAGES_PER_USER
     });
 });
 
-// ---------- تشغيل ----------
+// ============================================================
+// 12. تشغيل
+// ============================================================
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Hamad Mind Server v4.0.0 يعمل على المنفذ ${PORT}`);
+    console.log(`🚀 Hamad Mind Server v5.0.0 يعمل على المنفذ ${PORT}`);
     console.log(`📋 النماذج: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
-    console.log(`🔊 TTS جاهز | 🛡️ Admin جاهز`);
+    console.log(`🔊 TTS جاهز | 🛡️ Admin جاهز | 💾 MongoDB جاهز`);
+    console.log(`📊 حد الرسائل: ${MAX_MESSAGES_PER_USER} رسالة / 24 ساعة`);
 });
