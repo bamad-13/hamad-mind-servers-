@@ -1,6 +1,6 @@
 // ============================================================
-// Hamad Mind Server v2.0.0
-// تدوير المفاتيح + حفظ التاريخ + ذاكرة المستخدم + اختيار النموذج
+// Hamad Mind Server v3.0.0
+// تدوير المفاتيح + حفظ التاريخ + اختيار النموذج + تحويل النص لصوت (TTS)
 // ============================================================
 
 const express = require('express');
@@ -16,7 +16,7 @@ app.use(express.json({ limit: '50mb' }));
 // ---------- المسارات ----------
 const HISTORY_FILE = path.join(__dirname, 'gemini_chat_history.json');
 
-// ---------- قراءة المفاتيح من متغيرات البيئة ----------
+// ---------- قراءة المفاتيح ----------
 const RAW_KEYS = process.env.GEMINI_API_KEYS || '';
 const GEMINI_API_KEYS = RAW_KEYS.split(',').map(k => k.trim()).filter(k => k.length > 0);
 
@@ -41,7 +41,7 @@ function createClient() {
     return new GoogleGenAI({ apiKey: getCurrentKey() });
 }
 
-// ---------- النماذج المتاحة (أسماء موثوقة من Google) ----------
+// ---------- النماذج المتاحة ----------
 const AVAILABLE_MODELS = {
     'flash':        'gemini-2.5-flash',
     'flash-lite':   'gemini-2.5-flash-lite',
@@ -66,7 +66,7 @@ function saveJSON(file, data) {
     catch (e) { console.error('كتابة فاشلة:', e.message); }
 }
 
-// ---------- استدعاء Gemini مع تبديل المفاتيح تلقائيًا ----------
+// ---------- استدعاء Gemini مع تبديل المفاتيح ----------
 async function callGeminiWithRetry(modelKey, contents, systemPrompt) {
     const attempts = GEMINI_API_KEYS.length;
     let lastError = null;
@@ -94,7 +94,7 @@ async function callGeminiWithRetry(modelKey, contents, systemPrompt) {
 }
 
 // ============================================================
-// المسار الرئيسي: المحادثة
+// 1. مسار المحادثة
 // ============================================================
 app.post('/v1/chat', async (req, res) => {
     try {
@@ -141,7 +141,80 @@ app.post('/v1/chat', async (req, res) => {
     }
 });
 
-// ---------- مسار التحديث (يتوافق مع كودك) ----------
+// ============================================================
+// 2. مسار تحويل النص إلى صوت (TTS) - جديد
+// ============================================================
+app.post('/v1/tts', async (req, res) => {
+    try {
+        const { text, voice } = req.body;
+
+        if (!text) return res.status(400).json({ error: 'النص مطلوب' });
+
+        const attempts = GEMINI_API_KEYS.length;
+        let lastError = null;
+
+        for (let i = 0; i < attempts; i++) {
+            try {
+                const ai = createClient();
+
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash-preview-tts',
+                    contents: [{ role: 'user', parts: [{ text: text }] }],
+                    config: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: {
+                            voiceConfig: {
+                                prebuiltVoiceConfig: {
+                                    voiceName: voice || 'Kore'
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // استخراج الصوت من الرد
+                const candidate = response.candidates && response.candidates[0];
+                if (!candidate || !candidate.content || !candidate.content.parts) {
+                    throw new Error('لم يصل صوت من Gemini');
+                }
+
+                let audioBase64 = null;
+                for (const part of candidate.content.parts) {
+                    if (part.inlineData && part.inlineData.data) {
+                        audioBase64 = part.inlineData.data;
+                        break;
+                    }
+                }
+
+                if (!audioBase64) {
+                    throw new Error('لم يتم العثور على بيانات صوتية في الرد');
+                }
+
+                // إرجاع الصوت كـ base64
+                return res.json({
+                    data: audioBase64,
+                    mimeType: 'audio/wav',
+                    voice: voice || 'Kore'
+                });
+
+            } catch (error) {
+                lastError = error;
+                console.warn(`⚠️ فشل TTS بالمفتاح ${currentKeyIndex + 1}: ${error.message}`);
+                switchToNextKey();
+            }
+        }
+
+        throw new Error('فشلت جميع المفاتيح في TTS: ' + (lastError ? lastError.message : 'خطأ غير معروف'));
+
+    } catch (error) {
+        console.error('❌ /v1/tts:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// 3. مسار التحديث
+// ============================================================
 app.get('/v1/update', (req, res) => {
     res.json({
         version_code: 201,
@@ -151,12 +224,16 @@ app.get('/v1/update', (req, res) => {
     });
 });
 
-// ---------- مسار الصور (قيد التطوير) ----------
+// ============================================================
+// 4. مسار الصور (قيد التطوير)
+// ============================================================
 app.post('/v1/image', (req, res) => {
     res.status(501).json({ error: 'توليد الصور غير مهيأ بعد' });
 });
 
-// ---------- معلومات ----------
+// ============================================================
+// 5. معلومات
+// ============================================================
 app.get('/v1/models', (req, res) => {
     res.json({ models: Object.keys(AVAILABLE_MODELS) });
 });
@@ -164,12 +241,17 @@ app.get('/v1/models', (req, res) => {
 app.get('/', (req, res) => {
     res.json({
         status: 'Hamad Mind Server يعمل ✅',
+        version: '3.0.0',
         keysLoaded: GEMINI_API_KEYS.length,
         currentKeyIndex: currentKeyIndex + 1,
-        models: Object.keys(AVAILABLE_MODELS)
+        models: Object.keys(AVAILABLE_MODELS),
+        features: ['chat', 'tts', 'update']
     });
 });
 
+// ---------- تشغيل ----------
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 الخادم يعمل على المنفذ ${PORT}`);
+    console.log(`📋 النماذج: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
+    console.log(`🔊 TTS جاهز`);
 });
